@@ -13,6 +13,7 @@
  *   - Destroys tool-specific screen blankers by window class
  *   - Removes 14+ scammer registry restrictions
  *   - Network kill as nuclear option
+ *   - AnyDesk driver/service disabler (kills privacy screen at driver level)
  *
  * HOTKEYS (silent):
  *   Ctrl+Alt+P  —  Full Panic
@@ -23,17 +24,19 @@
  *   Ctrl+Alt+N  —  Kill Network
  *   Ctrl+Alt+R  —  Restore Network
  *   Ctrl+Alt+L  —  Capture Evidence (log scammer info)
+ *   Ctrl+Alt+D  —  Disable AnyDesk Driver (kills privacy screen)
  *   Ctrl+Alt+Q  —  Quit
  *
  * BUILD (Visual Studio Developer Command Prompt):
  *   cl /EHsc /O2 anti_scammer.cpp user32.lib advapi32.lib shell32.lib ^
  *      iphlpapi.lib ws2_32.lib gdi32.lib comctl32.lib comdlg32.lib ^
+ *      setupapi.lib ^
  *      /Fe:AntiScammer.exe
  *
  * BUILD (MinGW / g++):
  *   g++ -O2 -mwindows anti_scammer.cpp -o AntiScammer.exe ^
  *      -luser32 -ladvapi32 -lshell32 -liphlpapi -lws2_32 -lgdi32 ^
- *      -lcomctl32 -lcomdlg32
+ *      -lcomctl32 -lcomdlg32 -lsetupapi -lcfgmgr32
  *
  * MUST RUN AS ADMINISTRATOR.
  * License: Public domain.
@@ -57,6 +60,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <shlobj.h>
+#include <setupapi.h>       // NEW: for driver/device enumeration
+#include <cfgmgr32.h>       // NEW: for CM_Disable_DevNode
+#include <initguid.h>       // MinGW: instantiate GUID_DEVCLASS_* symbols in this TU
+#include <devguid.h>        // NEW: for display device GUIDs
 #include <string>
 #include <vector>
 #include <set>
@@ -72,6 +79,8 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "setupapi.lib")    // NEW
+#pragma comment(lib, "cfgmgr32.lib")   // NEW
 #pragma comment(linker, "/manifestdependency:\"type='win32' \
     name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
     processorArchitecture='*' publicKeyToken='6595b64144ccf1df' \
@@ -93,6 +102,7 @@
 #define ID_HOTKEY_NETRESTORE  7
 #define ID_HOTKEY_QUIT        8
 #define ID_HOTKEY_LOG         9
+#define ID_HOTKEY_ANYDESK_DRV 10   // NEW
 
 #define ID_BTN_PANIC          100
 #define ID_BTN_SCREEN         101
@@ -104,6 +114,7 @@
 #define ID_BTN_LOG            107
 #define ID_BTN_SAVELOG        108
 #define ID_BTN_QUIT           109
+#define ID_BTN_ANYDESK_DRV    110   // NEW
 
 #define ID_TRAY_SHOW          3000
 #define ID_TRAY_EXIT          3001
@@ -117,9 +128,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  GLOBALS
 // ═══════════════════════════════════════════════════════════════════════════
-HWND           g_msgWnd       = nullptr;   // Hidden message-only window
-HWND           g_guiWnd       = nullptr;   // Main GUI window
-HWND           g_statusBox    = nullptr;   // Status/log text area
+HWND           g_msgWnd       = nullptr;
+HWND           g_guiWnd       = nullptr;
+HWND           g_statusBox    = nullptr;
 HWND           g_btnFirewall  = nullptr;
 HINSTANCE      g_hInst        = nullptr;
 NOTIFYICONDATA g_nid          = {};
@@ -131,9 +142,9 @@ HFONT          g_fontTitle    = nullptr;
 HBRUSH         g_bgBrush      = nullptr;
 volatile LONG   g_actionRunning = 0;
 
-
-// Evidence log stored in memory
+// Evidence log stored in memory — protected by critical section
 std::wstring   g_evidenceLog;
+CRITICAL_SECTION g_evidenceCS;   // NEW: thread-safe evidence writes
 
 // Counters
 static int g_blankersDestroyed = 0;
@@ -166,6 +177,20 @@ static const wchar_t* REMOTE_PROCESSES[] = {
     L"bomgar-scc.exe", L"bomgar-rdp.exe",
     L"Remote Access.exe", L"simplegateway.exe",
     L"msra.exe", L"QuickAssist.exe",
+    L"ROMViewer.exe",
+    L"ROMServer.exe",
+    L"rfusclient.exe",
+    L"rutview.exe",
+    L"uvnc_service.exe",
+    L"AnyDeskMSI.exe",
+    L"ScreenConnect.Client.exe", L"ScreenConnect.Service.exe",
+    L"ZohoAssist.exe", L"ZohoURS.exe",
+    L"dwrcs.exe", L"dwrcst.exe",
+    L"remoting_host.exe",
+    L"RemoteUtilities.exe", L"rutserv.exe",
+    L"UltraViewer.exe", L"UltraViewer_Service.exe", L"UltraViewer_Desktop.exe",
+    L"UltraViewer_Desktop_64.exe", L"UltraViewer_Service_64.exe",
+
     nullptr
 };
 
@@ -178,6 +203,17 @@ static const wchar_t* BLANKER_WINDOW_CLASSES[] = {
     L"SplashtopBlankScreen", L"SRBlankScreen",
     L"VNCBlackWindow", L"vaborern",
     L"ISLBlankScreen", L"BomgarCurtain", L"SupremoBlackScreen",
+    L"ZohoAssistCurtain",
+    L"ZohoAssistBlankScreen",
+    L"DameWareBlankScreen",
+    L"DameWareMiniRemoteControlCurtain",
+    L"AnyDeskPrivacyOverlay", L"AnyDesk.PrivacyMode",
+    L"ScreenConnect.Client.CurtainForm", L"ScreenConnect.WindowsClient.CurtainForm",
+    L"RustDeskPrivacyMode", L"RustDeskPrivacyOverlay",
+    L"ChromeRemoteDesktopBlackScreen", L"ChromeRemoteDesktopCurtain",
+    L"RemoteUtilitiesBlankScreen", L"RemoteUtilitiesCurtain",
+    L"UltraViewerBlackScreen", L"UltraViewerPrivacyScreen", L"UltraViewerCurtain",
+
     nullptr
 };
 
@@ -196,6 +232,61 @@ static const wchar_t* SAFE_PROCESSES[] = {
     nullptr
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  DOCUMENTED / COMMON PRIVACY-SCREEN DRIVER + SERVICE TARGETS
+//
+//  Conservative design:
+//    - stop/disable known remote-control services that can keep privacy screen,
+//      curtain, mirror display, or input-blocking features alive;
+//    - disable only PRESENT display/monitor-class devices whose name or hardware
+//      ID clearly matches a known remote-control mirror/virtual display driver;
+//    - do NOT scan and disable arbitrary non-display devices.
+//
+//  This intentionally does not promise to defeat every driver-level block. It
+//  covers known/common driver or service controlled privacy-screen paths for
+//  AnyDesk, TeamViewer monitor/VPN components, UltraVNC mirror/DFMirage style
+//  drivers, DameWare mirror components, RustDesk virtual display naming, and
+//  service-backed curtain modes in ScreenConnect/ConnectWise, Zoho, Remote
+//  Utilities, Chrome Remote Desktop, and UltraViewer.
+// ═══════════════════════════════════════════════════════════════════════════
+
+static const wchar_t* PRIVACY_DRIVER_SERVICES[] = {
+    L"AnyDesk", L"AnyDeskMirror", L"adDriver",
+    L"TeamViewer", L"TeamViewer_Service", L"TeamViewerMonitor", L"TeamViewer VPN Adapter",
+    L"ScreenConnect Client", L"ScreenConnect.ClientService", L"ScreenConnect.Service",
+    L"ConnectWiseControl.Client", L"ConnectWiseControl.ClientService",
+    L"uvnc_service", L"UltraVNC", L"winvnc", L"mv2", L"DFMirage",
+    L"DameWare Mini Remote Control", L"DameWare Mini Remote Control Service",
+    L"DWMRCS", L"DWRCS", L"dwrcs",
+    L"Remote Utilities - Host", L"RemoteUtilities", L"RManService", L"rutserv",
+    L"chromoting", L"Chrome Remote Desktop Service",
+    L"ZohoURS", L"ZohoURSService", L"ZohoAssist",
+    L"RustDesk", L"rustdesk",
+    L"UltraViewer_Service", L"UltraViewerService", L"UltraViewer",
+    nullptr
+};
+
+static const wchar_t* PRIVACY_DRIVER_HWID_FRAGMENTS[] = {
+    L"anydesk", L"admirror",
+    L"teamviewer", L"tvmonitor",
+    L"ultravnc", L"uvnc", L"mv2", L"dfmirage",
+    L"dameware", L"dwrcs", L"mrcs",
+    L"rustdesk",
+    L"remote utilities", L"rut",
+    L"ultraviewer",
+    nullptr
+};
+
+static const wchar_t* PRIVACY_DRIVER_NAME_FRAGMENTS[] = {
+    L"AnyDesk", L"adMirror",
+    L"TeamViewer", L"TeamViewer Monitor", L"TeamViewer VPN",
+    L"UltraVNC", L"VNC Mirror", L"MV2", L"DFMirage", L"DemoForge Mirage",
+    L"DameWare", L"DameWare Mini Remote Control",
+    L"Remote Utilities",
+    L"RustDesk",
+    L"UltraViewer",
+    nullptr
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  UTILITIES
@@ -251,7 +342,9 @@ static void AppendStatus(const std::wstring& line) {
 }
 
 static void AppendEvidence(const std::wstring& line) {
+    EnterCriticalSection(&g_evidenceCS);
     g_evidenceLog += L"[" + GetTimestamp() + L"] " + line + L"\r\n";
+    LeaveCriticalSection(&g_evidenceCS);
 }
 
 static bool IsSafeProcess(const wchar_t* name) {
@@ -302,6 +395,278 @@ static std::wstring GetProcessPath(DWORD pid) {
     return L"<unknown path>";
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  NEW: ANYDESK DRIVER / SERVICE DISABLER
+//
+//  Strategy (does NOT kill AnyDesk.exe — caller has a separate tool):
+//
+//  Step 1 — Stop and disable all known AnyDesk SCM services.
+//            This stops ad_svc.exe and the mirror driver service,
+//            which releases the driver-level display hook that
+//            produces the black privacy screen.
+//
+//  Step 2 — Enumerate every display adapter device via SetupAPI.
+//            If the device's hardware ID or friendly name contains
+//            an AnyDesk-related string, disable it via
+//            CM_Disable_DevNode (Config Manager, no reboot required
+//            on mirror drivers since they're software-only devices).
+//
+//  Step 3 — Force a display mode reset via ChangeDisplaySettingsEx
+//            on all monitors. This flushes any residual WDDM overlay
+//            left by the driver before it was disabled.
+//
+//  Step 4 — Invalidate + redraw all windows so the desktop repaints
+//            cleanly over whatever the driver was displaying.
+//
+//  Reversibility: Services can be re-enabled via SCM. The display
+//  device re-enables itself on next AnyDesk launch (it re-registers).
+//  Nothing is uninstalled or deleted.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper: stop + disable a named SCM service. Returns true if service existed.
+static bool StopAndDisableService(SC_HANDLE scm, const wchar_t* serviceName) {
+    SC_HANDLE svc = OpenServiceW(scm,
+        serviceName,
+        SERVICE_STOP | SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS);
+    if (!svc) return false;
+
+    // Query current state
+    SERVICE_STATUS_PROCESS ssp = {};
+    DWORD needed = 0;
+    QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+        (BYTE*)&ssp, sizeof(ssp), &needed);
+
+    // Stop it if running
+    if (ssp.dwCurrentState != SERVICE_STOPPED &&
+        ssp.dwCurrentState != SERVICE_STOP_PENDING) {
+        SERVICE_STATUS ss = {};
+        ControlService(svc, SERVICE_CONTROL_STOP, &ss);
+
+        // Wait up to 3 seconds for stop
+        DWORD waited = 0;
+        while (waited < 3000) {
+            Sleep(200);
+            waited += 200;
+            QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+                (BYTE*)&ssp, sizeof(ssp), &needed);
+            if (ssp.dwCurrentState == SERVICE_STOPPED) break;
+        }
+    }
+
+    // Disable so it won't auto-restart
+    ChangeServiceConfigW(svc,
+        SERVICE_NO_CHANGE, SERVICE_DISABLED,
+        SERVICE_NO_CHANGE, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr);
+
+    CloseServiceHandle(svc);
+    return true;
+}
+
+// Helper: case-insensitive substring search in wide strings
+static bool WStrContainsI(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle) return false;
+    std::wstring h(haystack), n(needle);
+    // Lowercase both
+    for (auto& c : h) c = towlower(c);
+    for (auto& c : n) c = towlower(c);
+    return h.find(n) != std::wstring::npos;
+}
+
+// Helper: check if a device node matches AnyDesk by hardware ID or friendly name
+static bool IsPrivacyDriverDevice(HDEVINFO devInfo, SP_DEVINFO_DATA& devData) {
+    wchar_t buf[1024] = {};
+
+    // Check Hardware IDs
+    if (SetupDiGetDeviceRegistryPropertyW(devInfo, &devData,
+            SPDRP_HARDWAREID, nullptr, (BYTE*)buf, sizeof(buf), nullptr)) {
+        // Hardware IDs are multi-string (double-null terminated)
+        for (wchar_t* p = buf; *p; p += wcslen(p) + 1) {
+            for (int i = 0; PRIVACY_DRIVER_HWID_FRAGMENTS[i]; ++i) {
+                if (WStrContainsI(p, PRIVACY_DRIVER_HWID_FRAGMENTS[i]))
+                    return true;
+            }
+        }
+    }
+
+    // Check Friendly Name
+    memset(buf, 0, sizeof(buf));
+    if (SetupDiGetDeviceRegistryPropertyW(devInfo, &devData,
+            SPDRP_FRIENDLYNAME, nullptr, (BYTE*)buf, sizeof(buf), nullptr)) {
+        for (int i = 0; PRIVACY_DRIVER_NAME_FRAGMENTS[i]; ++i) {
+            if (WStrContainsI(buf, PRIVACY_DRIVER_NAME_FRAGMENTS[i]))
+                return true;
+        }
+    }
+
+    // Check Description as fallback
+    memset(buf, 0, sizeof(buf));
+    if (SetupDiGetDeviceRegistryPropertyW(devInfo, &devData,
+            SPDRP_DEVICEDESC, nullptr, (BYTE*)buf, sizeof(buf), nullptr)) {
+        for (int i = 0; PRIVACY_DRIVER_NAME_FRAGMENTS[i]; ++i) {
+            if (WStrContainsI(buf, PRIVACY_DRIVER_NAME_FRAGMENTS[i]))
+                return true;
+        }
+    }
+
+    return false;
+}
+
+// Helper: force display reset on all monitors to flush driver-level overlay
+static void FlushDisplayOverlay() {
+    // Enumerate all display devices and reset each one
+    DISPLAY_DEVICEW dd = {};
+    dd.cb = sizeof(dd);
+
+    for (DWORD devNum = 0;
+         EnumDisplayDevicesW(nullptr, devNum, &dd, 0);
+         devNum++) {
+
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+
+        // Get current mode
+        DEVMODEW dm = {};
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm))
+            continue;
+
+        // Toggle refresh — this forces WDDM to re-commit the display pipeline,
+        // evicting any injected overlay surfaces the driver was holding
+        ChangeDisplaySettingsExW(dd.DeviceName, &dm, nullptr,
+            CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    }
+
+    // Commit all pending display changes at once
+    ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+
+    // Wake the monitor and force a full repaint
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER,
+        (LPARAM)-1, SMTO_ABORTIFHUNG | SMTO_NORMAL, 250, nullptr);
+    InvalidateRect(nullptr, nullptr, TRUE);
+    UpdateWindow(GetDesktopWindow());
+}
+
+// MAIN FUNCTION: Disable AnyDesk driver without touching AnyDesk.exe
+static void ActionDisableAnyDeskDriver() {
+    int servicesDisabled = 0;
+    int devicesDisabled  = 0;
+    int devicesFailed    = 0;
+
+    AppendStatus(L"Disabling documented privacy-screen drivers/services...");
+
+    // ── Step 1: Stop and disable AnyDesk SCM services ─────────────────────
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr,
+        SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+
+    if (scm) {
+        for (int i = 0; PRIVACY_DRIVER_SERVICES[i]; ++i) {
+            if (StopAndDisableService(scm, PRIVACY_DRIVER_SERVICES[i])) {
+                AppendStatus(std::wstring(L"  Stopped service: ") + PRIVACY_DRIVER_SERVICES[i]);
+                servicesDisabled++;
+            }
+        }
+        CloseServiceHandle(scm);
+    } else {
+        AppendStatus(L"  Warning: Could not open SCM (need Administrator).");
+    }
+
+    // ── Step 2: Disable AnyDesk display device nodes via SetupAPI ─────────
+    //
+    // We enumerate ALL devices (not just display class) because AnyDesk's
+    // mirror driver may appear under different device classes depending on
+    // the Windows version and AnyDesk version.
+    //
+    // GUID_DEVCLASS_DISPLAY  = display adapters
+    // GUID_DEVCLASS_MONITOR  = monitors
+    // We check both, plus a full-system scan as fallback.
+
+    const GUID* guidsToCheck[] = {
+        &GUID_DEVCLASS_DISPLAY,
+        &GUID_DEVCLASS_MONITOR
+    };
+
+    for (int gi = 0; gi < 2; ++gi) {
+        HDEVINFO devInfo = SetupDiGetClassDevsW(
+            guidsToCheck[gi],
+            nullptr, nullptr,
+            DIGCF_PRESENT);
+
+        if (devInfo == INVALID_HANDLE_VALUE) continue;
+
+        SP_DEVINFO_DATA devData = {};
+        devData.cbSize = sizeof(devData);
+
+        for (DWORD idx = 0;
+             SetupDiEnumDeviceInfo(devInfo, idx, &devData);
+             idx++) {
+
+            if (!IsPrivacyDriverDevice(devInfo, devData)) continue;
+
+            // Get friendly name for logging
+            wchar_t nameBuf[512] = {};
+            SetupDiGetDeviceRegistryPropertyW(devInfo, &devData,
+                SPDRP_FRIENDLYNAME, nullptr,
+                (BYTE*)nameBuf, sizeof(nameBuf), nullptr);
+            if (!nameBuf[0]) {
+                SetupDiGetDeviceRegistryPropertyW(devInfo, &devData,
+                    SPDRP_DEVICEDESC, nullptr,
+                    (BYTE*)nameBuf, sizeof(nameBuf), nullptr);
+            }
+            if (!nameBuf[0]) wcscpy_s(nameBuf, L"<AnyDesk device>");
+
+            // Disable via Config Manager (takes effect immediately for
+            // software/mirror drivers — no reboot required)
+            CONFIGRET cr = CM_Disable_DevNode(devData.DevInst,
+                CM_DISABLE_UI_NOT_OK);   // suppress any driver UI
+
+            if (cr == CR_SUCCESS || cr == CR_ALREADY_SUCH_DEVINST) {
+                AppendStatus(std::wstring(L"  Disabled device: ") + nameBuf);
+                devicesDisabled++;
+            } else {
+                // Fallback: try SetupDiSetClassInstallParams + DIF_PROPERTYCHANGE
+                SP_PROPCHANGE_PARAMS pcp = {};
+                pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+                pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+                pcp.StateChange = DICS_DISABLE;
+                pcp.Scope       = DICS_FLAG_GLOBAL;
+                pcp.HwProfile   = 0;
+
+                if (SetupDiSetClassInstallParamsW(devInfo, &devData,
+                        &pcp.ClassInstallHeader, sizeof(pcp)) &&
+                    SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &devData)) {
+                    AppendStatus(std::wstring(L"  Disabled device (fallback): ") + nameBuf);
+                    devicesDisabled++;
+                } else {
+                    AppendStatus(std::wstring(L"  Could not disable: ") + nameBuf +
+                        L" (CR=" + std::to_wstring(cr) + L")");
+                    devicesFailed++;
+                }
+            }
+        }
+
+        SetupDiDestroyDeviceInfoList(devInfo);
+
+        // Stop after first matching display/monitor class pass.
+        if (devicesDisabled > 0) break;
+    }
+
+    // ── Step 3: Flush any residual driver-level display overlay ───────────
+    FlushDisplayOverlay();
+
+    // ── Step 4: Report ─────────────────────────────────────────────────────
+    if (servicesDisabled == 0 && devicesDisabled == 0) {
+        AppendStatus(L"Privacy driver/service check: nothing found to disable.");
+        AppendStatus(L"  The privacy screen may be window-level only — try Fix Screen.");
+        AppendStatus(L"  Or the active tool may be using a window-level curtain only.");
+    } else {
+        AppendStatus(L"Privacy drivers/services handled. Services stopped: " +
+            std::to_wstring(servicesDisabled) +
+            L", devices disabled: " + std::to_wstring(devicesDisabled) +
+            (devicesFailed ? L", failed: " + std::to_wstring(devicesFailed) : L"") + L".");
+        AppendStatus(L"Privacy screen should be gone. Use Kill Connections if the remote tool is still running.");
+    }
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  EVIDENCE LOGGER — Captures everything about the scammer
@@ -314,13 +679,11 @@ static void LogEvidenceHeader() {
     AppendEvidence(L"═══════════════════════════════════════════════════");
     AppendEvidence(L"");
 
-    // Get computer name
     wchar_t compName[256] = {};
     DWORD compSize = 256;
     GetComputerNameW(compName, &compSize);
     AppendEvidence(L"Computer Name: " + std::wstring(compName));
 
-    // Get username
     wchar_t userName[256] = {};
     DWORD userSize = 256;
     GetUserNameW(userName, &userSize);
@@ -336,16 +699,12 @@ static void LogRemoteConnections() {
 
     DWORD size = 0;
     GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    if (size == 0) {
-        AppendEvidence(L"  (Could not read TCP table)");
-        return;
-    }
+    if (size == 0) { AppendEvidence(L"  (Could not read TCP table)"); return; }
 
     std::vector<BYTE> buffer(size);
     if (GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET,
             TCP_TABLE_OWNER_PID_ALL, 0) != NO_ERROR) {
-        AppendEvidence(L"  (Could not read TCP table)");
-        return;
+        AppendEvidence(L"  (Could not read TCP table)"); return;
     }
 
     auto* table = reinterpret_cast<MIB_TCPTABLE_OWNER_PID*>(buffer.data());
@@ -358,17 +717,14 @@ static void LogRemoteConnections() {
         DWORD pid = row.dwOwningPid;
 
         if (pid == 0 || pid == 4 || pid == GetCurrentProcessId()) continue;
-
-        bool isRemotePort = remotePorts.count(lp) || remotePorts.count(rp);
-        if (!isRemotePort) continue;
+        if (!remotePorts.count(lp) && !remotePorts.count(rp)) continue;
         if (row.dwState != MIB_TCP_STATE_ESTAB && row.dwState != MIB_TCP_STATE_LISTEN) continue;
 
         std::wstring localIP  = IPToString(row.dwLocalAddr);
         std::wstring remoteIP = IPToString(row.dwRemoteAddr);
         std::wstring procName = GetProcessName(pid);
         std::wstring procPath = GetProcessPath(pid);
-
-        std::wstring state = (row.dwState == MIB_TCP_STATE_ESTAB) ? L"ESTABLISHED" : L"LISTENING";
+        std::wstring state    = (row.dwState == MIB_TCP_STATE_ESTAB) ? L"ESTABLISHED" : L"LISTENING";
 
         AppendEvidence(L"");
         AppendEvidence(L"  *** SUSPICIOUS CONNECTION ***");
@@ -378,13 +734,12 @@ static void LogRemoteConnections() {
         AppendEvidence(L"  Local:  " + localIP + L":" + std::to_wstring(lp));
         AppendEvidence(L"  Remote: " + remoteIP + L":" + std::to_wstring(rp));
         AppendEvidence(L"  >>> SCAMMER IP: " + remoteIP + L" <<<");
-
         found++;
     }
 
-    if (found == 0) {
+    if (found == 0)
         AppendEvidence(L"  No active remote-access connections found on known ports.");
-    } else {
+    else {
         AppendEvidence(L"");
         AppendEvidence(L"  Total suspicious connections: " + std::to_wstring(found));
     }
@@ -396,8 +751,7 @@ static void LogAllRemoteProcesses() {
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) {
-        AppendEvidence(L"  (Could not enumerate processes)");
-        return;
+        AppendEvidence(L"  (Could not enumerate processes)"); return;
     }
 
     PROCESSENTRY32W pe = {};
@@ -419,9 +773,7 @@ static void LogAllRemoteProcesses() {
     }
     CloseHandle(snap);
 
-    if (found == 0) {
-        AppendEvidence(L"  No known remote-access programs found running.");
-    }
+    if (found == 0) AppendEvidence(L"  No known remote-access programs found running.");
     AppendEvidence(L"");
 }
 
@@ -462,28 +814,19 @@ static void LogNetworkAdapters() {
 
     ULONG bufLen = 0;
     GetAdaptersInfo(nullptr, &bufLen);
-    if (bufLen == 0) {
-        AppendEvidence(L"  (Could not enumerate adapters)");
-        return;
-    }
+    if (bufLen == 0) { AppendEvidence(L"  (Could not enumerate adapters)"); return; }
 
     std::vector<BYTE> buf(bufLen);
     auto* adapters = reinterpret_cast<IP_ADAPTER_INFO*>(buf.data());
     if (GetAdaptersInfo(adapters, &bufLen) == NO_ERROR) {
         for (auto* a = adapters; a; a = a->Next) {
-            wchar_t wName[256] = {};
+            wchar_t wName[256] = {}, wIP[64] = {}, wGW[64] = {}, mac[32] = {};
             MultiByteToWideChar(CP_ACP, 0, a->Description, -1, wName, 256);
-            wchar_t wIP[64] = {};
             MultiByteToWideChar(CP_ACP, 0, a->IpAddressList.IpAddress.String, -1, wIP, 64);
-            wchar_t wGW[64] = {};
             MultiByteToWideChar(CP_ACP, 0, a->GatewayList.IpAddress.String, -1, wGW, 64);
-
-            // MAC address
-            wchar_t mac[32] = {};
             swprintf(mac, 32, L"%02X:%02X:%02X:%02X:%02X:%02X",
                 a->Address[0], a->Address[1], a->Address[2],
                 a->Address[3], a->Address[4], a->Address[5]);
-
             AppendEvidence(L"  Adapter: " + std::wstring(wName));
             AppendEvidence(L"    IP:      " + std::wstring(wIP));
             AppendEvidence(L"    Gateway: " + std::wstring(wGW));
@@ -505,7 +848,9 @@ static void LogRecentEventLog() {
 }
 
 static void ActionCaptureEvidence() {
+    EnterCriticalSection(&g_evidenceCS);
     g_evidenceLog.clear();
+    LeaveCriticalSection(&g_evidenceCS);
 
     AppendStatus(L"Capturing scammer evidence...");
 
@@ -529,40 +874,39 @@ static void ActionCaptureEvidence() {
 }
 
 static void ActionSaveEvidence() {
-    if (g_evidenceLog.empty()) {
+    EnterCriticalSection(&g_evidenceCS);
+    bool empty = g_evidenceLog.empty();
+    std::wstring logCopy = g_evidenceLog;
+    LeaveCriticalSection(&g_evidenceCS);
+
+    if (empty) {
         AppendStatus(L"No evidence captured yet. Click 'Capture Evidence' first.");
         return;
     }
 
-    // Build default filename with timestamp
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t defaultName[128];
     swprintf(defaultName, 128, L"ScamReport_%04d%02d%02d_%02d%02d%02d.txt",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
 
-    // Get Desktop path
     wchar_t desktopPath[MAX_PATH] = {};
-    SHGetFolderPathW(nullptr, 0x0010 /* CSIDL_DESKTOPDIRECTORY */, nullptr, 0, desktopPath);
-
+    SHGetFolderPathW(nullptr, 0x0010, nullptr, 0, desktopPath);
     std::wstring fullPath = std::wstring(desktopPath) + L"\\" + defaultName;
 
-    // Write the file
     HANDLE hFile = CreateFileW(fullPath.c_str(), GENERIC_WRITE, 0, nullptr,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     if (hFile != INVALID_HANDLE_VALUE) {
-        // Write UTF-8 BOM
         BYTE bom[] = { 0xEF, 0xBB, 0xBF };
         DWORD written;
         WriteFile(hFile, bom, 3, &written, nullptr);
 
-        // Convert to UTF-8
-        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, g_evidenceLog.c_str(),
-            (int)g_evidenceLog.length(), nullptr, 0, nullptr, nullptr);
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, logCopy.c_str(),
+            (int)logCopy.length(), nullptr, 0, nullptr, nullptr);
         std::vector<char> utf8(utf8Len);
-        WideCharToMultiByte(CP_UTF8, 0, g_evidenceLog.c_str(),
-            (int)g_evidenceLog.length(), utf8.data(), utf8Len, nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, logCopy.c_str(),
+            (int)logCopy.length(), utf8.data(), utf8Len, nullptr, nullptr);
 
         WriteFile(hFile, utf8.data(), utf8Len, &written, nullptr);
         CloseHandle(hFile);
@@ -576,7 +920,7 @@ static void ActionSaveEvidence() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ACTION: RESTORE SCREEN (silent)
+//  ACTION: RESTORE SCREEN
 // ═══════════════════════════════════════════════════════════════════════════
 static bool WindowClassMatches(HWND hwnd, const wchar_t* wantedClass) {
     wchar_t cls[256] = {};
@@ -586,52 +930,45 @@ static bool WindowClassMatches(HWND hwnd, const wchar_t* wantedClass) {
 
 static void HideOneBlankerWindow(HWND hwnd, int* count) {
     if (!hwnd || !IsWindow(hwnd)) return;
-
-    // Do not move windows off-screen. Hiding/closing is enough and avoids
-    // the "all my windows got pushed away" side effect.
     PostMessageW(hwnd, WM_CLOSE, 0, 0);
     Sleep(25);
     if (IsWindow(hwnd)) ShowWindow(hwnd, SW_HIDE);
     if (count) (*count)++;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  ACTION: RESTORE SCREEN (silent)
-// ═══════════════════════════════════════════════════════════════════════════
 static void ActionRestoreScreen() {
     g_blankersDestroyed = 0;
     g_overlaysMinimized = 0;
 
-    // Target only known black-screen/privacy/curtain window classes.
-    // The previous fullscreen fallback was too broad and could affect Chrome,
-    // browsers, video players, games, or normal maximized windows.
     struct ClassCtx { const wchar_t* cls; int* count; };
 
     for (int i = 0; BLANKER_WINDOW_CLASSES[i]; ++i) {
         ClassCtx ctx = { BLANKER_WINDOW_CLASSES[i], &g_blankersDestroyed };
         EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
             auto* c = reinterpret_cast<ClassCtx*>(lp);
-            if (WindowClassMatches(hwnd, c->cls)) {
+            if (WindowClassMatches(hwnd, c->cls))
                 HideOneBlankerWindow(hwnd, c->count);
-            }
             return TRUE;
         }, reinterpret_cast<LPARAM>(&ctx));
     }
 
-    // Target only highly specific black-screen/privacy titles. No generic
-    // fullscreen scanning, and no SetWindowPos off-screen movement.
     const wchar_t* titles[] = {
         L"Black Screen", L"Privacy Mode", L"Blank Screen",
-        L"Screen Blanked", L"Curtain", nullptr
+        L"Screen Blanked", L"Curtain",
+        L"AnyDesk Privacy Mode", L"RustDesk Privacy Mode",
+        L"ScreenConnect Curtain", L"ScreenConnect Black Screen",
+        L"Chrome Remote Desktop Curtain",
+        L"Remote Utilities Blank Screen",
+        L"UltraViewer Black Screen", L"UltraViewer Privacy Screen",
+        nullptr
     };
     for (int i = 0; titles[i]; ++i) {
         EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
             const wchar_t* wanted = reinterpret_cast<const wchar_t*>(lp);
             wchar_t title[256] = {};
             GetWindowTextW(hwnd, title, 256);
-            if (_wcsicmp(title, wanted) == 0) {
+            if (_wcsicmp(title, wanted) == 0)
                 HideOneBlankerWindow(hwnd, &g_blankersDestroyed);
-            }
             return TRUE;
         }, reinterpret_cast<LPARAM>(titles[i]));
     }
@@ -641,7 +978,6 @@ static void ActionRestoreScreen() {
 
     while (ShowCursor(TRUE) < 0) {}
 
-    // Avoid SendMessage(HWND_BROADCAST), which can hang if another app is stuck.
     SendMessageTimeoutW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, (LPARAM)-1,
         SMTO_ABORTIFHUNG | SMTO_NORMAL, 250, nullptr);
 
@@ -651,12 +987,12 @@ static void ActionRestoreScreen() {
     InvalidateRect(nullptr, nullptr, TRUE);
 
     AppendStatus(L"Screen fixed. Removed " + std::to_wstring(g_blankersDestroyed) +
-        L" known blanker/curtain window(s). Generic fullscreen windows were left alone.");
+        L" known blanker/curtain window(s).");
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ACTION: RESTORE INPUT (silent)
+//  ACTION: RESTORE INPUT
 // ═══════════════════════════════════════════════════════════════════════════
 static void ActionRestoreInput() {
     BlockInput(FALSE);
@@ -696,7 +1032,16 @@ static void ActionRestoreInput() {
 
     const wchar_t* blockers[] = {
         L"InputBlocker.exe", L"LockInput.exe", L"BlockInput.exe",
-        L"DesktopShield.exe", L"syskey.exe", nullptr
+        L"DesktopShield.exe", L"syskey.exe",
+        L"AnyDeskMSI.exe", L"ad_svc.exe",
+        L"ScreenConnect.Client.exe", L"ScreenConnect.Service.exe",
+        L"ScreenConnect.ClientService.exe", L"ScreenConnect.WindowsClient.exe",
+        L"ZohoAssist.exe", L"ZohoURS.exe", L"ZohoURSService.exe",
+        L"dwrcs.exe", L"dwrcst.exe",
+        L"remoting_host.exe",
+        L"RemoteUtilities.exe", L"rutserv.exe",
+        L"UltraViewer.exe", L"UltraViewer_Service.exe", L"UltraViewer_Desktop.exe",
+ nullptr
     };
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap != INVALID_HANDLE_VALUE) {
@@ -720,7 +1065,7 @@ static void ActionRestoreInput() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ACTION: KILL CONNECTIONS (silent)
+//  ACTION: KILL CONNECTIONS
 // ═══════════════════════════════════════════════════════════════════════════
 static std::set<DWORD> GetSuspiciousPIDs() {
     std::set<DWORD> pids;
@@ -785,7 +1130,7 @@ static void ActionKillConnections() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ACTION: FIREWALL TOGGLE (silent)
+//  ACTION: FIREWALL TOGGLE
 // ═══════════════════════════════════════════════════════════════════════════
 static void UpdateFirewallButton() {
     if (g_btnFirewall) {
@@ -824,7 +1169,7 @@ static void ActionToggleFirewall() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  ACTION: NETWORK KILL / RESTORE (silent)
+//  ACTION: NETWORK KILL / RESTORE
 // ═══════════════════════════════════════════════════════════════════════════
 static void ActionNetworkKill() {
     RunCommand(L"cmd.exe /c wmic path win32_networkadapter where \"NetEnabled=true\" call disable");
@@ -845,12 +1190,13 @@ static void ActionNetworkRestore() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  FULL PANIC (silent)
+//  FULL PANIC
 // ═══════════════════════════════════════════════════════════════════════════
 static void DoFullPanic() {
     AppendStatus(L"=== FULL PANIC ACTIVATED ===");
-    ActionCaptureEvidence();   // Log evidence BEFORE killing everything
+    ActionCaptureEvidence();
     ActionRestoreInput();
+    ActionDisableAnyDeskDriver();   // driver/service-level privacy-screen fix before window fix
     ActionRestoreScreen();
     ActionKillConnections();
     if (!g_firewallActive) ActionToggleFirewall();
@@ -858,25 +1204,18 @@ static void DoFullPanic() {
     AppendStatus(L"=== FULL PANIC COMPLETE — You are safe. Hang up the phone! ===");
 }
 
-// Run slow actions off the GUI/message thread so buttons, repainting,
-// and registered hotkeys remain responsive while netsh, gpupdate, wmic,
-// process scans, and evidence capture are running.
 typedef void (*ActionFn)();
 
 static DWORD WINAPI ActionThreadProc(LPVOID param) {
     ActionFn fn = reinterpret_cast<ActionFn>(param);
     if (fn) fn();
-
     InterlockedExchange(&g_actionRunning, 0);
     if (g_guiWnd) PostMessageW(g_guiWnd, WM_APP_ACTION_DONE, 0, 0);
     return 0;
 }
 
 static void RunAsync(ActionFn fn) {
-    // Do not block emergency actions behind a global busy flag.
-    // The old guard could get stuck if a Windows command or window operation hung.
     InterlockedExchange(&g_actionRunning, 1);
-
     HANDLE hThread = CreateThread(nullptr, 0, ActionThreadProc,
         reinterpret_cast<LPVOID>(fn), 0, nullptr);
     if (!hThread) {
@@ -891,24 +1230,23 @@ static void RunAsync(ActionFn fn) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  GUI WINDOW
 // ═══════════════════════════════════════════════════════════════════════════
-
-// Owner-drawn button colors
 struct BtnColor { COLORREF bg; COLORREF fg; };
 static BtnColor GetBtnColor(int id) {
     switch (id) {
-    case ID_BTN_PANIC:      return { RGB(220, 38, 38),  RGB(255,255,255) }; // Red
-    case ID_BTN_SCREEN:     return { RGB(59, 130, 246), RGB(255,255,255) }; // Blue
-    case ID_BTN_INPUT:      return { RGB(59, 130, 246), RGB(255,255,255) };
-    case ID_BTN_KILL:       return { RGB(234, 88, 12),  RGB(255,255,255) }; // Orange
-    case ID_BTN_FIREWALL:   return g_firewallActive
-                                   ? BtnColor{ RGB(22, 163, 74),  RGB(255,255,255) }   // Green
-                                   : BtnColor{ RGB(107, 114, 128), RGB(255,255,255) };  // Gray
-    case ID_BTN_NETKILL:    return { RGB(127, 29, 29),  RGB(255,255,255) }; // Dark red
-    case ID_BTN_NETRESTORE: return { RGB(22, 163, 74),  RGB(255,255,255) }; // Green
-    case ID_BTN_LOG:        return { RGB(124, 58, 237), RGB(255,255,255) }; // Purple
-    case ID_BTN_SAVELOG:    return { RGB(124, 58, 237), RGB(255,255,255) };
-    case ID_BTN_QUIT:       return { RGB(107, 114, 128), RGB(255,255,255) }; // Gray
-    default:                return { RGB(59, 130, 246), RGB(255,255,255) };
+    case ID_BTN_PANIC:        return { RGB(220, 38, 38),  RGB(255,255,255) };
+    case ID_BTN_SCREEN:       return { RGB(59, 130, 246), RGB(255,255,255) };
+    case ID_BTN_INPUT:        return { RGB(59, 130, 246), RGB(255,255,255) };
+    case ID_BTN_KILL:         return { RGB(234, 88, 12),  RGB(255,255,255) };
+    case ID_BTN_FIREWALL:     return g_firewallActive
+                                     ? BtnColor{ RGB(22, 163, 74),  RGB(255,255,255) }
+                                     : BtnColor{ RGB(107, 114, 128), RGB(255,255,255) };
+    case ID_BTN_NETKILL:      return { RGB(127, 29, 29),  RGB(255,255,255) };
+    case ID_BTN_NETRESTORE:   return { RGB(22, 163, 74),  RGB(255,255,255) };
+    case ID_BTN_LOG:          return { RGB(124, 58, 237), RGB(255,255,255) };
+    case ID_BTN_SAVELOG:      return { RGB(124, 58, 237), RGB(255,255,255) };
+    case ID_BTN_ANYDESK_DRV:  return { RGB(220, 120, 0),  RGB(255,255,255) }; // Amber
+    case ID_BTN_QUIT:         return { RGB(107, 114, 128), RGB(255,255,255) };
+    default:                  return { RGB(59, 130, 246), RGB(255,255,255) };
     }
 }
 
@@ -917,35 +1255,29 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_CREATE: {
         int y = 15;
-        int bw = 340;  // button width
-        int bh = 48;   // button height
+        int bw = 340;
+        int bh = 48;
         int gap = 8;
         int x = 20;
 
-        // Title
-        HWND title = CreateWindowW(L"STATIC",
-            L"Anti-Scammer Protection",
+        HWND title = CreateWindowW(L"STATIC", L"Anti-Scammer Protection",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             x, y, bw, 36, hwnd, nullptr, g_hInst, nullptr);
         SendMessageW(title, WM_SETFONT, (WPARAM)g_fontTitle, TRUE);
         y += 42;
 
-        // Subtitle
-        HWND sub = CreateWindowW(L"STATIC",
-            L"Press a button or use the hotkey shown",
+        HWND sub = CreateWindowW(L"STATIC", L"Press a button or use the hotkey shown",
             WS_CHILD | WS_VISIBLE | SS_CENTER,
             x, y, bw, 20, hwnd, nullptr, g_hInst, nullptr);
         SendMessageW(sub, WM_SETFONT, (WPARAM)g_fontMed, TRUE);
         y += 30;
 
-        // ── BIG PANIC BUTTON ──
-        HWND btnPanic = CreateWindowW(L"BUTTON",
-            L"STOP THE SCAMMER\n(Ctrl+Alt+P)",
+        // BIG PANIC BUTTON
+        CreateWindowW(L"BUTTON", L"STOP THE SCAMMER\n(Ctrl+Alt+P)",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             x, y, bw, 70, hwnd, (HMENU)ID_BTN_PANIC, g_hInst, nullptr);
         y += 70 + gap;
 
-        // ── Individual action buttons (2 columns) ──
         int halfW = (bw - gap) / 2;
 
         CreateWindowW(L"BUTTON", L"Fix Screen\n(Ctrl+Alt+S)",
@@ -959,7 +1291,6 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         CreateWindowW(L"BUTTON", L"Kill Connections\n(Ctrl+Alt+K)",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             x, y, halfW, bh, hwnd, (HMENU)ID_BTN_KILL, g_hInst, nullptr);
-
         g_btnFirewall = CreateWindowW(L"BUTTON", L"Firewall: OFF\n(Ctrl+Alt+F)",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             x + halfW + gap, y, halfW, bh, hwnd, (HMENU)ID_BTN_FIREWALL, g_hInst, nullptr);
@@ -973,7 +1304,13 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             x + halfW + gap, y, halfW, bh, hwnd, (HMENU)ID_BTN_NETRESTORE, g_hInst, nullptr);
         y += bh + gap;
 
-        // ── Evidence buttons ──
+        // NEW: AnyDesk driver button — full width, stands out
+        CreateWindowW(L"BUTTON",
+            L"Kill Privacy Screen Drivers\n(Ctrl+Alt+D)",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+            x, y, bw, bh, hwnd, (HMENU)ID_BTN_ANYDESK_DRV, g_hInst, nullptr);
+        y += bh + gap;
+
         CreateWindowW(L"BUTTON", L"Capture Evidence\n(Ctrl+Alt+L)",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             x, y, halfW, bh, hwnd, (HMENU)ID_BTN_LOG, g_hInst, nullptr);
@@ -982,7 +1319,6 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             x + halfW + gap, y, halfW, bh, hwnd, (HMENU)ID_BTN_SAVELOG, g_hInst, nullptr);
         y += bh + gap + 4;
 
-        // ── Status log area ──
         HWND logLabel = CreateWindowW(L"STATIC", L"Activity Log:",
             WS_CHILD | WS_VISIBLE,
             x, y, bw, 18, hwnd, nullptr, g_hInst, nullptr);
@@ -991,25 +1327,22 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
         g_statusBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            x, y, bw, 160, hwnd, nullptr, g_hInst, nullptr);
+            x, y, bw, 150, hwnd, nullptr, g_hInst, nullptr);
         SendMessageW(g_statusBox, WM_SETFONT, (WPARAM)g_fontLog, TRUE);
-        y += 160 + gap;
+        y += 150 + gap;
 
-        // ── Quit button ──
         CreateWindowW(L"BUTTON", L"Close Window (keeps running in tray)",
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
             x, y, bw, 32, hwnd, (HMENU)ID_BTN_QUIT, g_hInst, nullptr);
 
         AppendStatusOnGuiThread(L"Anti-Scammer v4 ready. You are protected.");
+        AppendStatusOnGuiThread(L"Ctrl+Alt+D targets documented privacy-screen drivers/services.");
         return 0;
     }
 
     case WM_APP_APPEND_STATUS: {
         auto* line = reinterpret_cast<std::wstring*>(lParam);
-        if (line) {
-            AppendStatusOnGuiThread(*line);
-            delete line;
-        }
+        if (line) { AppendStatusOnGuiThread(*line); delete line; }
         return 0;
     }
 
@@ -1021,52 +1354,35 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     case WM_DRAWITEM: {
         auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         if (dis->CtlType != ODT_BUTTON) break;
-
         BtnColor col = GetBtnColor(dis->CtlID);
-
-        // Darken on press
         COLORREF bg = col.bg;
-        if (dis->itemState & ODS_SELECTED) {
+        if (dis->itemState & ODS_SELECTED)
             bg = RGB(GetRValue(bg)*3/4, GetGValue(bg)*3/4, GetBValue(bg)*3/4);
-        }
-
-        // Draw rounded-ish button
         HBRUSH brush = CreateSolidBrush(bg);
         HPEN pen = CreatePen(PS_SOLID, 1, bg);
         SelectObject(dis->hDC, brush);
         SelectObject(dis->hDC, pen);
         RoundRect(dis->hDC, dis->rcItem.left, dis->rcItem.top,
             dis->rcItem.right, dis->rcItem.bottom, 12, 12);
-
-        // Draw text
         SetBkMode(dis->hDC, TRANSPARENT);
         SetTextColor(dis->hDC, col.fg);
-
-        HFONT font = (dis->CtlID == ID_BTN_PANIC) ? g_fontBig :
-                     (dis->CtlID == ID_BTN_QUIT) ? g_fontMed : g_fontMed;
+        HFONT font = (dis->CtlID == ID_BTN_PANIC) ? g_fontBig : g_fontMed;
         SelectObject(dis->hDC, font);
-
         wchar_t text[256] = {};
         GetWindowTextW(dis->hwndItem, text, 256);
-
-        // Handle multi-line text
         RECT rc = dis->rcItem;
-        DrawTextW(dis->hDC, text, -1, &rc,
-            DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
-
+        DrawTextW(dis->hDC, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
         DeleteObject(brush);
         DeleteObject(pen);
-
-        // Focus rect
         if (dis->itemState & ODS_FOCUS) {
-            RECT fr = dis->rcItem;
-            InflateRect(&fr, -3, -3);
+            RECT fr = dis->rcItem; InflateRect(&fr, -3, -3);
             DrawFocusRect(dis->hDC, &fr);
         }
         return TRUE;
     }
 
-    case WM_CTLCOLORSTATIC: {
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT: {
         HDC hdc = (HDC)wParam;
         SetBkColor(hdc, CLR_BG);
         SetTextColor(hdc, RGB(30, 30, 30));
@@ -1075,16 +1391,17 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
-        case ID_BTN_PANIC:      RunAsync(DoFullPanic); break;
-        case ID_BTN_SCREEN:     RunAsync(ActionRestoreScreen); break;
-        case ID_BTN_INPUT:      RunAsync(ActionRestoreInput); break;
-        case ID_BTN_KILL:       RunAsync(ActionKillConnections); break;
-        case ID_BTN_FIREWALL:   RunAsync(ActionToggleFirewall); break;
-        case ID_BTN_NETKILL:    RunAsync(ActionNetworkKill); break;
-        case ID_BTN_NETRESTORE: RunAsync(ActionNetworkRestore); break;
-        case ID_BTN_LOG:        RunAsync(ActionCaptureEvidence); break;
-        case ID_BTN_SAVELOG:    RunAsync(ActionSaveEvidence); break;
-        case ID_BTN_QUIT:       ShowWindow(hwnd, SW_HIDE); break;
+        case ID_BTN_PANIC:         RunAsync(DoFullPanic); break;
+        case ID_BTN_SCREEN:        RunAsync(ActionRestoreScreen); break;
+        case ID_BTN_INPUT:         RunAsync(ActionRestoreInput); break;
+        case ID_BTN_KILL:          RunAsync(ActionKillConnections); break;
+        case ID_BTN_FIREWALL:      RunAsync(ActionToggleFirewall); break;
+        case ID_BTN_NETKILL:       RunAsync(ActionNetworkKill); break;
+        case ID_BTN_NETRESTORE:    RunAsync(ActionNetworkRestore); break;
+        case ID_BTN_LOG:           RunAsync(ActionCaptureEvidence); break;
+        case ID_BTN_SAVELOG:       RunAsync(ActionSaveEvidence); break;
+        case ID_BTN_ANYDESK_DRV:   RunAsync(ActionDisableAnyDeskDriver); break;
+        case ID_BTN_QUIT:          ShowWindow(hwnd, SW_HIDE); break;
         }
         return 0;
 
@@ -1103,41 +1420,30 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 }
 
 static void CreateGUI() {
-    // Create fonts
-    g_fontBig = CreateFontW(22, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g_fontMed = CreateFontW(15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g_fontLog = CreateFontW(13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
-    g_fontTitle = CreateFontW(26, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g_bgBrush = CreateSolidBrush(CLR_BG);
+    g_fontBig   = CreateFontW(22, 0, 0, 0, FW_BOLD,     0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_fontMed   = CreateFontW(15, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_fontLog   = CreateFontW(13, 0, 0, 0, FW_NORMAL,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
+    g_fontTitle = CreateFontW(26, 0, 0, 0, FW_BOLD,     0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_bgBrush   = CreateSolidBrush(CLR_BG);
 
     WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = GuiWndProc;
-    wc.hInstance = g_hInst;
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = GuiWndProc;
+    wc.hInstance     = g_hInst;
     wc.lpszClassName = L"AntiScammerGUI";
-    wc.hIcon = LoadIcon(nullptr, IDI_SHIELD);
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hIcon         = LoadIcon(nullptr, IDI_SHIELD);
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = g_bgBrush;
     RegisterClassExW(&wc);
 
-    int winW = 400;
-    int winH = 720;
+    int winW = 400, winH = 780;
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-    g_guiWnd = CreateWindowExW(
-        WS_EX_TOPMOST,
-        L"AntiScammerGUI",
-        L"Anti-Scammer v4",
+    g_guiWnd = CreateWindowExW(WS_EX_TOPMOST, L"AntiScammerGUI", L"Anti-Scammer v4",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        screenW - winW - 20,  // Position near right edge
-        (screenH - winH) / 2,
-        winW, winH,
-        nullptr, nullptr, g_hInst, nullptr);
+        screenW - winW - 20, (screenH - winH) / 2,
+        winW, winH, nullptr, nullptr, g_hInst, nullptr);
 
     ShowWindow(g_guiWnd, SW_SHOW);
     UpdateWindow(g_guiWnd);
@@ -1148,12 +1454,12 @@ static void CreateGUI() {
 //  SYSTEM TRAY
 // ═══════════════════════════════════════════════════════════════════════════
 static void AddTrayIcon(HWND hwnd) {
-    g_nid.cbSize = sizeof(g_nid);
-    g_nid.hWnd = hwnd;
-    g_nid.uID = IDI_TRAY;
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.cbSize          = sizeof(g_nid);
+    g_nid.hWnd            = hwnd;
+    g_nid.uID             = IDI_TRAY;
+    g_nid.uFlags          = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIcon(nullptr, IDI_SHIELD);
+    g_nid.hIcon           = LoadIcon(nullptr, IDI_SHIELD);
     wcscpy_s(g_nid.szTip, L"Anti-Scammer v4 (double-click to open)");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
@@ -1164,22 +1470,23 @@ static void RemoveTrayIcon() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  HIDDEN MESSAGE WINDOW (handles hotkeys + tray)
+//  HIDDEN MESSAGE WINDOW
 // ═══════════════════════════════════════════════════════════════════════════
 static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
 
     case WM_HOTKEY:
         switch (wParam) {
-        case ID_HOTKEY_PANIC:      RunAsync(DoFullPanic); break;
-        case ID_HOTKEY_SCREEN:     RunAsync(ActionRestoreScreen); break;
-        case ID_HOTKEY_INPUT:      RunAsync(ActionRestoreInput); break;
-        case ID_HOTKEY_KILL:       RunAsync(ActionKillConnections); break;
-        case ID_HOTKEY_FIREWALL:   RunAsync(ActionToggleFirewall); break;
-        case ID_HOTKEY_NETKILL:    RunAsync(ActionNetworkKill); break;
-        case ID_HOTKEY_NETRESTORE: RunAsync(ActionNetworkRestore); break;
-        case ID_HOTKEY_LOG:        RunAsync(ActionCaptureEvidence); break;
-        case ID_HOTKEY_QUIT:       PostQuitMessage(0); break;
+        case ID_HOTKEY_PANIC:       RunAsync(DoFullPanic); break;
+        case ID_HOTKEY_SCREEN:      RunAsync(ActionRestoreScreen); break;
+        case ID_HOTKEY_INPUT:       RunAsync(ActionRestoreInput); break;
+        case ID_HOTKEY_KILL:        RunAsync(ActionKillConnections); break;
+        case ID_HOTKEY_FIREWALL:    RunAsync(ActionToggleFirewall); break;
+        case ID_HOTKEY_NETKILL:     RunAsync(ActionNetworkKill); break;
+        case ID_HOTKEY_NETRESTORE:  RunAsync(ActionNetworkRestore); break;
+        case ID_HOTKEY_LOG:         RunAsync(ActionCaptureEvidence); break;
+        case ID_HOTKEY_ANYDESK_DRV: RunAsync(ActionDisableAnyDeskDriver); break;
+        case ID_HOTKEY_QUIT:        PostQuitMessage(0); break;
         }
         return 0;
 
@@ -1191,24 +1498,17 @@ static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Quit");
             SetForegroundWindow(hwnd);
-            TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN,
-                pt.x, pt.y, 0, hwnd, nullptr);
+            TrackPopupMenu(hMenu, TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, nullptr);
             DestroyMenu(hMenu);
         } else if (lParam == WM_LBUTTONDBLCLK) {
-            if (g_guiWnd) {
-                ShowWindow(g_guiWnd, SW_SHOW);
-                SetForegroundWindow(g_guiWnd);
-            }
+            if (g_guiWnd) { ShowWindow(g_guiWnd, SW_SHOW); SetForegroundWindow(g_guiWnd); }
         }
         return 0;
 
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case ID_TRAY_SHOW:
-            if (g_guiWnd) {
-                ShowWindow(g_guiWnd, SW_SHOW);
-                SetForegroundWindow(g_guiWnd);
-            }
+            if (g_guiWnd) { ShowWindow(g_guiWnd, SW_SHOW); SetForegroundWindow(g_guiWnd); }
             break;
         case ID_TRAY_EXIT:
             PostQuitMessage(0);
@@ -1239,6 +1539,8 @@ static LRESULT CALLBACK MsgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     g_hInst = hInstance;
 
+    InitializeCriticalSection(&g_evidenceCS);   // NEW
+
     // Admin check
     BOOL isAdmin = FALSE;
     PSID adminGroup = nullptr;
@@ -1256,7 +1558,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
             L"\"Run as administrator\".\n\n"
             L"Continue with limited protection?",
             L"Anti-Scammer", MB_YESNO | MB_ICONWARNING);
-        if (r == IDNO) return 0;
+        if (r == IDNO) { DeleteCriticalSection(&g_evidenceCS); return 0; }
     }
 
     // Single instance
@@ -1264,39 +1566,39 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxW(nullptr, L"Anti-Scammer is already running!\nCheck your system tray.",
             L"Anti-Scammer", MB_OK | MB_ICONINFORMATION);
+        DeleteCriticalSection(&g_evidenceCS);
         return 0;
     }
 
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
-
     InitCommonControls();
 
-    // Hidden message window (for hotkeys + tray)
     WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = MsgWndProc;
-    wc.hInstance = hInstance;
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = MsgWndProc;
+    wc.hInstance     = hInstance;
     wc.lpszClassName = L"AntiScammerClass";
-    wc.hIcon = LoadIcon(nullptr, IDI_SHIELD);
+    wc.hIcon         = LoadIcon(nullptr, IDI_SHIELD);
     RegisterClassExW(&wc);
 
     g_msgWnd = CreateWindowExW(0, L"AntiScammerClass", L"AntiScammer",
         0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, hInstance, nullptr);
-    if (!g_msgWnd) return 1;
+    if (!g_msgWnd) { DeleteCriticalSection(&g_evidenceCS); return 1; }
 
     // Register hotkeys
     struct HK { int id; UINT mod; UINT vk; };
     HK hotkeys[] = {
-        { ID_HOTKEY_PANIC,      MOD_CONTROL | MOD_ALT, 'P' },
-        { ID_HOTKEY_SCREEN,     MOD_CONTROL | MOD_ALT, 'S' },
-        { ID_HOTKEY_INPUT,      MOD_CONTROL | MOD_ALT, 'I' },
-        { ID_HOTKEY_KILL,       MOD_CONTROL | MOD_ALT, 'K' },
-        { ID_HOTKEY_FIREWALL,   MOD_CONTROL | MOD_ALT, 'F' },
-        { ID_HOTKEY_NETKILL,    MOD_CONTROL | MOD_ALT, 'N' },
-        { ID_HOTKEY_NETRESTORE, MOD_CONTROL | MOD_ALT, 'R' },
-        { ID_HOTKEY_LOG,        MOD_CONTROL | MOD_ALT, 'L' },
-        { ID_HOTKEY_QUIT,       MOD_CONTROL | MOD_ALT, 'Q' },
+        { ID_HOTKEY_PANIC,       MOD_CONTROL | MOD_ALT, 'P' },
+        { ID_HOTKEY_SCREEN,      MOD_CONTROL | MOD_ALT, 'S' },
+        { ID_HOTKEY_INPUT,       MOD_CONTROL | MOD_ALT, 'I' },
+        { ID_HOTKEY_KILL,        MOD_CONTROL | MOD_ALT, 'K' },
+        { ID_HOTKEY_FIREWALL,    MOD_CONTROL | MOD_ALT, 'F' },
+        { ID_HOTKEY_NETKILL,     MOD_CONTROL | MOD_ALT, 'N' },
+        { ID_HOTKEY_NETRESTORE,  MOD_CONTROL | MOD_ALT, 'R' },
+        { ID_HOTKEY_LOG,         MOD_CONTROL | MOD_ALT, 'L' },
+        { ID_HOTKEY_ANYDESK_DRV, MOD_CONTROL | MOD_ALT, 'D' },  // NEW
+        { ID_HOTKEY_QUIT,        MOD_CONTROL | MOD_ALT, 'Q' },
     };
     for (auto& hk : hotkeys)
         RegisterHotKey(g_msgWnd, hk.id, hk.mod, hk.vk);
@@ -1306,20 +1608,24 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0)) {
-        // Route messages to the correct window
         if (g_guiWnd && IsDialogMessage(g_guiWnd, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
     for (auto& hk : hotkeys)
-        UnregisterHotKey(g_msgWnd, hk.id);
+UnregisterHotKey(g_msgWnd, hk.id);
+
     WSACleanup();
+
     if (g_fontBig) DeleteObject(g_fontBig);
     if (g_fontMed) DeleteObject(g_fontMed);
     if (g_fontLog) DeleteObject(g_fontLog);
     if (g_fontTitle) DeleteObject(g_fontTitle);
     if (g_bgBrush) DeleteObject(g_bgBrush);
+
+    DeleteCriticalSection(&g_evidenceCS);
+
     ReleaseMutex(hMutex);
     CloseHandle(hMutex);
     return 0;
